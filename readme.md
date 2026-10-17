@@ -1,6 +1,6 @@
-# PhAdmin
+# phadmin
 
-A lightweight, self-hosted web application built with **Flask** and **phue** for managing and controlling **Philips Hue** smart lighting systems. It features an embedded single-page dashboard with role-based access control (RBAC), room management, live sensor telemetry, scene saving, and bridge pairing.
+A lightweight, self-hosted web application built with Flask and phue for managing Philips Hue smart lighting systems. It features an embedded single-page dashboard with role-based access control (RBAC), room management, live sensor telemetry, scene saving, and bridge pairing.
 
 ---
 
