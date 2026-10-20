@@ -33,3 +33,6 @@ A lightweight, self-hosted web application built with Flask and phue for managin
 3. **First-Time Sign-In:**
    * On the first launch, a default `admin` account with a randomly generated secure password will be printed in your terminal.
    * Sign in using these credentials, navigate to the **Bridges** tab to pair your Philips Hue Bridge, and update your account details under the **Account** tab.
+
+
+![screenshot](pphadmin.png)
