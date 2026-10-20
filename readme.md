@@ -35,4 +35,4 @@ A lightweight, self-hosted web application built with Flask and phue for managin
    * Sign in using these credentials, navigate to the **Bridges** tab to pair your Philips Hue Bridge, and update your account details under the **Account** tab.
 
 
-![screenshot](pphadmin.png)
+![screenshot](phadmin.png)
