@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hue Scene Editor</title>
+<style>
+:root{--bg:#eceee9;--sf:#f9faf7;--s2:#e2e5de;--bd:#cfd4cb;--tx:#1d2330;--mu:#667064;--rm:#2f8f8b;--lt:#d98a1c;--pr:#2f5d9e;--pf:#fff;--dg:#c0392b}
+@media(prefers-color-scheme:dark){:root{--bg:#161b22;--sf:#1e252e;--s2:#29323d;--bd:#36414e;--tx:#e6e9e4;--mu:#98a39b;--rm:#4fc1bb;--lt:#f0b04a;--pr:#7aa7ec;--pf:#10151b;--dg:#ff7b6b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 "Segoe UI",system-ui,-apple-system,sans-serif}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 18px;background:var(--sf);border-bottom:1px solid var(--bd);position:sticky;top:0;z-index:5}
+.logo{font:italic 700 1.15rem Georgia,"Times New Roman",serif}
+#name{font:inherit;font-weight:600;color:inherit;border:1px solid transparent;background:transparent;padding:6px 8px;border-radius:6px;min-width:14ch}
+#name:hover,#name:focus{border-color:var(--bd);background:var(--s2)}
+.sp{flex:1}
+button,select,input,textarea{font:inherit;color:inherit}
+.b{background:var(--s2);border:1px solid var(--bd);border-radius:6px;padding:6px 11px;cursor:pointer}
+.b:hover{border-color:var(--pr)}
+.b.p{background:var(--pr);border-color:var(--pr);color:var(--pf);font-weight:600}
+.b.s{padding:2px 8px;font-size:.8rem}
+:focus-visible{outline:2px solid var(--pr);outline-offset:1px}
+.app{display:grid;grid-template-columns:270px minmax(0,1fr);gap:22px;max-width:1180px;margin:0 auto;padding:18px}
+@media(max-width:820px){.app{grid-template-columns:1fr}}
+aside h4{margin:18px 0 8px;font-size:.95rem}
+aside h4:first-child{margin-top:0}
+.list{display:flex;flex-wrap:wrap;gap:6px}
+.obj{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:var(--sf);border:1px solid var(--bd);cursor:grab;user-select:none;font-size:.88rem}
+.obj.g{border-radius:4px;border-left:4px solid var(--rm)}
+.obj.l{border-radius:99px;border-left:4px solid var(--lt)}
+.obj i{font-style:normal;cursor:pointer;color:var(--mu)}
+.obj i:hover{color:var(--dg)}
+.act{display:flex;gap:10px;align-items:center;padding:8px 10px;margin-bottom:6px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;cursor:grab}
+.act>span{font-size:1.3rem}
+.mu{color:var(--mu);font-size:.82rem}
+.step{position:relative;margin:0 0 12px 36px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;padding:10px 12px}
+.step::before{content:"";position:absolute;left:-25px;top:0;bottom:-13px;border-left:2px solid var(--bd)}
+.step::after{content:attr(data-n);position:absolute;left:-36px;top:9px;width:22px;height:22px;border-radius:50%;background:var(--pr);color:var(--pf);font-size:.75rem;font-weight:700;display:grid;place-items:center}
+.step.sel{border-color:var(--pr)}
+.step.mb{box-shadow:0 -4px 0 var(--pr)}
+.step.ma{box-shadow:0 4px 0 var(--pr)}
+.sh{display:flex;align-items:center;gap:8px}
+.grip{cursor:grab;color:var(--mu);font-size:1.1rem;padding:0 4px}
+.x{border:0;background:none;color:var(--mu);cursor:pointer;font-size:1rem}
+.x:hover{color:var(--dg)}
+.tz{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:38px;margin:8px 0 2px;padding:6px;border:1px dashed var(--bd);border-radius:6px}
+.tz.over{border-color:var(--pr);background:color-mix(in srgb,var(--pr) 10%,transparent)}
+.f{display:flex;gap:10px;align-items:center;margin-top:8px}
+.f>label{width:84px;flex:none;color:var(--mu)}
+.c{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:1}
+select,input[type=number]{background:var(--s2);border:1px solid var(--bd);border-radius:6px;padding:5px 8px}
+input[type=number]{width:80px}
+.dur{display:inline-flex;gap:4px}
+input[type=range]{width:170px;accent-color:var(--pr)}
+input[type=range].ct{accent-color:var(--lt)}
+output{min-width:5ch;font-variant-numeric:tabular-nums}
+input[type=color]{width:34px;height:28px;padding:0;border:1px solid var(--bd);border-radius:6px;background:none}
+.sws{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+.sw{width:22px;height:22px;border-radius:50%;box-shadow:0 0 0 1px var(--bd);border:2px solid var(--sf);cursor:pointer;display:inline-block}
+.chk{display:flex;gap:6px;align-items:center}
+#end{margin-left:36px;padding:18px;text-align:center;border:2px dashed var(--bd);border-radius:6px;color:var(--mu)}
+#end.over{border-color:var(--pr);color:var(--tx)}
+#note{margin:0 0 14px;padding:8px 12px;border-left:4px solid var(--lt);background:var(--sf)}
+details{margin:16px 0 0 36px}
+textarea{width:100%;height:240px;margin-top:8px;padding:8px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--tx);color:var(--bg);padding:8px 16px;border-radius:6px;opacity:0;pointer-events:none;transition:opacity .2s}
+#toast.on{opacity:1}
+#toast.err{background:var(--dg);color:#fff}
+[hidden]{display:none!important}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<header>
+  <span class="logo">Hue Scene Editor</span>
+  <input id="name" aria-label="Scene name" placeholder="Scene name">
+  <label class="mu">Repeat <select id="rm"><option value="once">once</option><option value="count">N times</option><option value="forever">forever</option></select></label>
+  <input id="rc" type="number" min="2" value="2" aria-label="Repeat count" hidden>
+  <span class="sp"></span>
+  <button class="b" id="bNew">New</button>
+  <button class="b" id="bBridge" title="Open http://BRIDGE-IP/api/YOUR-USERNAME in a browser, save the page as a .json file, and load it here">Load rooms &amp; lights</button>
+  <button class="b" id="bImp">Open scene</button>
+  <button class="b p" id="bExp">Export</button>
+  <input type="file" id="fb" accept=".json,application/json" hidden>
+  <input type="file" id="fi" accept=".json,application/json" hidden>
+</header>
+<div class="app">
+  <aside id="pal"></aside>
+  <main id="main">
+    <div id="note">These are sample rooms and lights. Open this editor from phadmin (<b>/scene-editor</b>) to load yours automatically, or use <b>Load rooms &amp; lights</b>.</div>
+    <div id="tl"></div>
+    <div id="end">Drag an action here, or drop a room or light to start a step</div>
+    <details><summary>JSON preview</summary><textarea id="pv" readonly aria-label="Export preview"></textarea></details>
+  </main>
+</div>
+<div id="toast" role="status"></div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const TITLES={set:'Set state',fade:'Dim / brighten',wait:'Timer'};
+const fresh=()=>({name:'My scene',repeat:{mode:'once',count:2},steps:[]});
+let S=fresh();
+let T={g:[{name:'Living Room'},{name:'Bedroom'},{name:'Kitchen'}],l:[{name:'Floor lamp'},{name:'Desk lamp'},{name:'Ceiling light'},{name:'Bedside lamp'}]};
+let sample=true,sel=-1,drag=null;
+try{const d=JSON.parse(localStorage.getItem('hue-scene-editor'));if(d&&d.S&&Array.isArray(d.S.steps)&&d.T&&d.T.g&&d.T.l){S=d.S;T=d.T;sample=!!d.sample}}catch(_){}
+const save=()=>{try{localStorage.setItem('hue-scene-editor',JSON.stringify({S,T,sample}))}catch(_){}};
+const key=(k,o)=>k+':'+(o.id||'name:'+o.name);
+const find=k=>(k[0]==='g'?T.g:T.l).find(o=>key(k[0],o)===k);
+const nameOf=k=>{const o=find(k);return o?o.name:k.replace(/^[gl]:(name:)?/,'')};
+const setP=(o,p,v)=>{const a=p.split('.');while(a.length>1)o=o[a.shift()];o[a[0]]=v};
+let tt;const toast=(m,err)=>{const t=$('#toast');t.textContent=m;t.className='on'+(err?' err':'');clearTimeout(tt);tt=setTimeout(()=>t.className='',err?3800:1800)};
+
+function newStep(type,t=[],preset){
+  if(type==='set'){const rc=preset==='randcolor';return{type,t,power:rc?'keep':'on',bm:'keep',bri:100,color:{mode:rc?'list':'keep',hex:'#ff8800',kelvin:2700,hexes:rc?['#ff3b30','#34c759','#0a84ff','#ffcc00']:[]}}}
+  if(type==='fade')return{type,t,fm:'current',from:100,to:0,secs:600,wait:true};
+  return{type:'wait',mode:preset==='randwait'?'random':'fixed',secs:5,min:2,max:10};
+}
+
+/* ---------- editor controls ---------- */
+const opts=(cur,a)=>a.map(([v,l])=>`<option value="${v}"${v===cur?' selected':''}>${l}</option>`).join('');
+const row=(l,i)=>`<div class="f"><label>${l}</label><div class="c">${i}</div></div>`;
+const sl=(k,v,min,max,step,cls,txt)=>`<input type="range" class="${cls}" data-k="${k}" min="${min}" max="${max}" step="${step}" value="${v}"><output>${txt}</output>`;
+const dur=(k,v)=>{const m=v>=60&&v%30===0;return`<span class="dur" data-dk="${k}"><input type="number" min="0" step="any" value="${m?v/60:v}" aria-label="Duration"><select aria-label="Unit"><option value="1">sec</option><option value="60"${m?' selected':''}>min</option></select></span>`};
+const colorCtl=c=>c.mode==='fixed'?`<input type="color" data-k="color.hex" value="${esc(c.hex)}" aria-label="Color">`
+  :c.mode==='white'?sl('color.kelvin',c.kelvin,2000,6500,100,'ct',c.kelvin+' K')
+  :c.mode==='list'?`<span class="sws">${c.hexes.map((h,j)=>`<i class="sw" style="background:${esc(h)}" data-rs="${j}" title="Remove this color"></i>`).join('')}<input type="color" value="#ff3b30" aria-label="Color to add"><button class="b s" data-addc>+ add</button></span>`
+  :c.mode==='any'?'<span class="mu">A new random color each time</span>':'';
+function body(s){
+  if(s.type==='wait')return row('Pause',`<select data-k="mode">${opts(s.mode,[['fixed','for a set time'],['random','for a random time']])}</select>`)
+    +(s.mode==='random'?row('Between',dur('min',s.min)+' and '+dur('max',s.max)):row('Duration',dur('secs',s.secs)));
+  if(s.type==='fade')return row('From',`<select data-k="fm">${opts(s.fm,[['current','current brightness'],['set','a set brightness']])}</select>`+(s.fm==='set'?sl('from',s.from,0,100,1,'',s.from+'%'):''))
+    +row('To',sl('to',s.to,0,100,1,'',s.to+'%')+'<span class="mu">0% turns the light off at the end</span>')
+    +row('Over',dur('secs',s.secs))
+    +row('',`<label class="chk"><input type="checkbox" data-k="wait"${s.wait?' checked':''}> Wait until finished before the next step</label>`);
+  const c=s.color;
+  return row('Power',`<select data-k="power">${opts(s.power,[['keep','No change'],['on','Turn on'],['off','Turn off']])}</select>`)
+    +row('Brightness',`<select data-k="bm">${opts(s.bm,[['keep','No change'],['set','Set to…']])}</select>`+(s.bm==='set'?sl('bri',s.bri,1,100,1,'',s.bri+'%'):''))
+    +row('Color',`<select data-k="color.mode">${opts(c.mode,[['keep','No change'],['fixed','Color'],['white','White, warm to cool'],['list','Random from my colors'],['any','Any random color']])}</select>`+colorCtl(c));
+}
+
+/* ---------- rendering ---------- */
+function render(){
+  $('#tl').innerHTML=S.steps.map((s,i)=>`<div class="step${sel===i?' sel':''}" data-i="${i}" data-n="${i+1}">
+    <div class="sh"><span class="grip" draggable="true" data-drag="step" data-i="${i}" title="Drag to reorder">⠿</span><b>${TITLES[s.type]}</b><span class="sp"></span><button class="x" data-del title="Delete step" aria-label="Delete step">✕</button></div>
+    ${s.t?`<div class="tz">${s.t.map(k=>`<span class="obj ${k[0]}">${k[0]==='g'?'🛋️':'💡'} ${esc(nameOf(k))}<i data-rt="${esc(k)}" title="Remove">×</i></span>`).join('')||'<span class="mu">Drop rooms or lights here</span>'}</div>`:''}
+    ${body(s)}</div>`).join('');
+  preview();
+}
+function pal(){
+  const ch=(k,o)=>`<span class="obj ${k}" draggable="true" data-drag="target" data-key="${esc(key(k,o))}">${k==='g'?'🛋️':'💡'} ${esc(o.name)}</span>`;
+  const acts=[['set','','🎚️','Set state','On/off, brightness, color'],['fade','','🌗','Dim / brighten','Fade over time'],['wait','','⏱️','Timer','Pause the sequence'],['wait','randwait','🎲','Random timer','Pause for a random time'],['set','randcolor','🌈','Random color','Pick a color at random']];
+  $('#pal').innerHTML=`<h4>Rooms &amp; groups</h4><div class="list">${T.g.map(o=>ch('g',o)).join('')}<button class="b s" data-add="g">+ add</button></div>
+    <h4>Lights</h4><div class="list">${T.l.map(o=>ch('l',o)).join('')}<button class="b s" data-add="l">+ add</button></div>
+    <h4>Actions</h4>${acts.map(([t,p,i,n,d])=>`<div class="act" draggable="true" data-drag="action" data-type="${t}" data-preset="${p}"><span>${i}</span><div><b>${n}</b><div class="mu">${d}</div></div></div>`).join('')}
+    <p class="mu">Drag onto the timeline, or click. Drop a room or light onto a step to aim it there.</p>`;
+  $('#note').hidden=!sample;
+}
+const sync=()=>{$('#name').value=S.name;$('#rm').value=S.repeat.mode;$('#rc').value=S.repeat.count;$('#rc').hidden=S.repeat.mode!=='count'};
+
+/* ---------- export / import ---------- */
+function build(){
+  const used=new Set();S.steps.forEach(s=>(s.t||[]).forEach(k=>used.add(k)));
+  const targets={};used.forEach(k=>{const o=find(k);targets[k]=Object.assign({type:k[0]==='g'?'group':'light',name:nameOf(k)},o&&o.id?{id:o.id}:{},o&&o.lights?{lights:o.lights}:{})});
+  const steps=S.steps.map(s=>{
+    if(s.type==='wait')return s.mode==='random'?{type:'wait',random:{min:s.min,max:Math.max(s.min,s.max)}}:{type:'wait',seconds:s.secs};
+    if(s.type==='fade')return{type:'fade',targets:s.t,from:s.fm==='set'?s.from:'current',to:s.to,seconds:s.secs,wait:s.wait};
+    const o={type:'set',targets:s.t},c=s.color;
+    if(s.power!=='keep')o.power=s.power;
+    if(s.bm==='set')o.brightness=s.bri;
+    if(c.mode==='fixed')o.color={mode:'fixed',hex:c.hex};
+    else if(c.mode==='white')o.color={mode:'white',kelvin:c.kelvin,mirek:Math.max(153,Math.min(500,Math.round(1e6/c.kelvin)))};
+    else if(c.mode==='list')o.color={mode:'random_choice',hexes:c.hexes};
+    else if(c.mode==='any')o.color={mode:'random_any'};
+    return o;
+  });
+  const r=S.repeat;
+  return{format:'hue-scene-sequence',version:1,name:S.name,repeat:r.mode==='count'?{mode:'count',count:r.count}:{mode:r.mode},targets,steps,
+    notes:'Steps run in order. Brightness is 0-100%. Colors are sRGB hex; white uses kelvin (mirek = 1,000,000 / kelvin). A fade to 0% turns the light off at the end. A fade with wait=false lets the next step start straight away. Random choices are made fresh each time a step runs. A group target applies to all its lights.'};
+}
+const preview=()=>{$('#pv').value=JSON.stringify(build(),null,2);save()};
+function check(){
+  if(!S.steps.length)return'Add at least one step first.';
+  for(const[i,s]of S.steps.entries()){
+    if(s.t&&!s.t.length)return`Step ${i+1} needs a room or light. Drop one onto it.`;
+    if(s.type==='set'&&s.color.mode==='list'&&!s.color.hexes.length)return`Step ${i+1}: add at least one color to pick from.`;
+    if(s.type==='set'&&s.power==='keep'&&s.bm==='keep'&&s.color.mode==='keep')return`Step ${i+1} changes nothing. Choose power, brightness or color.`;
+  }
+  return'';
+}
+function fromJSON(o){
+  if(!o||o.format!=='hue-scene-sequence')throw new Error('That file is not a Hue scene export.');
+  const map={};
+  for(const[k,v]of Object.entries(o.targets||{})){
+    const kind=v.type==='group'?'g':'l',list=kind==='g'?T.g:T.l;
+    let t=list.find(x=>v.id?x.id===v.id:(!x.id&&x.name===v.name));
+    if(!t){t={name:v.name};if(v.id)t.id=v.id;if(v.lights)t.lights=v.lights;list.push(t)}
+    map[k]=key(kind,t);
+  }
+  S.name=o.name||'Imported scene';const r=o.repeat||{};S.repeat={mode:r.mode||'once',count:r.count||2};
+  S.steps=(o.steps||[]).map(x=>{
+    const t=(x.targets||[]).map(k=>map[k]||k);
+    if(x.type==='wait'){const s=newStep('wait');if(x.random){s.mode='random';s.min=x.random.min;s.max=x.random.max}else s.secs=x.seconds??5;return s}
+    if(x.type==='fade'){const s=newStep('fade',t);s.fm=typeof x.from==='number'?'set':'current';if(s.fm==='set')s.from=x.from;s.to=x.to??0;s.secs=x.seconds??60;s.wait=x.wait!==false;return s}
+    const s=newStep('set',t),c=x.color||{};
+    s.power=x.power||'keep';s.bm=x.brightness!=null?'set':'keep';if(x.brightness!=null)s.bri=x.brightness;
+    s.color.mode={fixed:'fixed',white:'white',random_choice:'list',random_any:'any'}[c.mode]||'keep';
+    if(c.hex)s.color.hex=c.hex;if(c.kelvin)s.color.kelvin=c.kelvin;if(c.hexes)s.color.hexes=c.hexes;
+    return s;
+  });
+  sel=-1;
+}
+function loadBridge(o,keep){
+  let L=o.lights,G=o.groups;const v=Object.values(o);
+  if(!L&&!G){if(v.length&&v.every(x=>x&&x.state))L=o;else if(v.length&&v.every(x=>x&&Array.isArray(x.lights)))G=o}
+  if(!L&&!G)throw new Error('No lights or groups found in that file.');
+  const cl=keep&&!sample?T.l.filter(x=>!x.id):[],cg=keep&&!sample?T.g.filter(x=>!x.id):[]; // keep hand-added entries on auto-load
+  if(sample){T={g:[],l:[]};sample=false}
+  if(L)T.l=Object.entries(L).map(([id,x])=>({id,name:x.name||'Light '+id})).concat(cl);
+  if(G)T.g=Object.entries(G).map(([id,x])=>({id,name:x.name||'Group '+id,lights:x.lights||[]})).concat(cg);
+}
+const readJSON=(inp,fn)=>inp.addEventListener('change',async()=>{const f=inp.files[0];inp.value='';if(!f)return;try{fn(JSON.parse(await f.text()))}catch(e){toast(e.message||'Could not read that file.',true)}});
+readJSON($('#fi'),o=>{fromJSON(o);sync();pal();render();toast('Scene opened')});
+readJSON($('#fb'),o=>{loadBridge(o);pal();render();toast('Rooms and lights loaded')});
+$('#bImp').onclick=()=>$('#fi').click();
+$('#bBridge').onclick=()=>$('#fb').click();
+$('#bNew').onclick=()=>{if(S.steps.length&&!confirm('Start a new scene? Unsaved steps will be lost.'))return;S=fresh();sel=-1;sync();render()};
+$('#bExp').onclick=()=>{
+  const m=check();if(m){toast(m,true);return}
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(build(),null,2)],{type:'application/json'}));
+  a.download=((S.name||'scene').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'scene')+'.hue-scene.json';
+  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);toast('Exported '+a.download);
+};
+$('#name').oninput=e=>{S.name=e.target.value;preview()};
+$('#rm').onchange=e=>{S.repeat.mode=e.target.value;sync();preview()};
+$('#rc').oninput=e=>{S.repeat.count=Math.max(2,+e.target.value||2);preview()};
+
+/* ---------- editing steps ---------- */
+function onEdit(e){
+  const el=e.target,st=el.closest('.step');if(!st)return;
+  const s=S.steps[+st.dataset.i],d=el.closest('.dur');
+  if(d){setP(s,d.dataset.dk,Math.max(0,(parseFloat(d.querySelector('input').value)||0)*parseFloat(d.querySelector('select').value)));preview();return}
+  const k=el.dataset.k;if(!k)return;
+  const v=el.type==='checkbox'?el.checked:(el.type==='range'||el.type==='number')?+el.value:el.value;
+  setP(s,k,v);
+  if(el.type==='range'){const o=el.parentNode.querySelector('output');if(o)o.textContent=v+(k.endsWith('kelvin')?' K':'%')}
+  if(el.tagName==='SELECT'&&e.type==='change')render();else preview();
+}
+$('#tl').addEventListener('input',onEdit);
+$('#tl').addEventListener('change',onEdit);
+$('#tl').addEventListener('click',e=>{
+  const st=e.target.closest('.step');if(!st)return;
+  const i=+st.dataset.i,s=S.steps[i];let a;
+  if(e.target.closest('[data-del]')){S.steps.splice(i,1);sel=-1;render();return}
+  if(a=e.target.closest('[data-rt]')){s.t=s.t.filter(k=>k!==a.dataset.rt);render();return}
+  if(a=e.target.closest('[data-rs]')){s.color.hexes.splice(+a.dataset.rs,1);render();return}
+  if(a=e.target.closest('[data-addc]')){s.color.hexes.push(a.previousElementSibling.value);render();return}
+  if(sel!==i){sel=i;document.querySelectorAll('.step').forEach(x=>x.classList.toggle('sel',+x.dataset.i===i))}
+});
+$('#pal').addEventListener('click',e=>{
+  let a;
+  if(a=e.target.closest('[data-add]')){
+    const n=prompt(a.dataset.add==='g'?'Room or group name:':'Light name:');
+    if(n&&n.trim()){(a.dataset.add==='g'?T.g:T.l).push({name:n.trim()});pal();save()}return;
+  }
+  if(a=e.target.closest('[data-drag="target"]')){
+    const s=S.steps[sel];
+    if(s&&s.t){if(!s.t.includes(a.dataset.key))s.t.push(a.dataset.key)}else{S.steps.push(newStep('set',[a.dataset.key]));sel=S.steps.length-1}
+    render();return;
+  }
+  if(a=e.target.closest('[data-drag="action"]')){S.steps.push(newStep(a.dataset.type,[],a.dataset.preset));sel=S.steps.length-1;render()}
+});
+
+/* ---------- drag and drop ---------- */
+const main=$('#main');
+const clr=()=>document.querySelectorAll('.over,.mb,.ma').forEach(x=>x.classList.remove('over','mb','ma'));
+document.addEventListener('dragstart',e=>{
+  const el=e.target.closest&&e.target.closest('[data-drag]');if(!el)return;
+  drag={kind:el.dataset.drag,key:el.dataset.key,type:el.dataset.type,preset:el.dataset.preset,i:+el.dataset.i};
+  e.dataTransfer.effectAllowed='copyMove';
+  try{e.dataTransfer.setData('text/plain',el.dataset.drag)}catch(_){}
+  if(drag.kind==='step'){try{e.dataTransfer.setDragImage(el.closest('.step'),12,12)}catch(_){}}
+});
+document.addEventListener('dragend',()=>{drag=null;clr()});
+main.addEventListener('dragover',e=>{
+  if(!drag)return;e.preventDefault();clr();
+  const tz=e.target.closest('.tz'),st=e.target.closest('.step');
+  if(tz&&drag.kind==='target'){tz.classList.add('over');return}
+  if(st&&drag.kind!=='target'){const r=st.getBoundingClientRect();st.classList.add(e.clientY<r.top+r.height/2?'mb':'ma')}
+  else if(!st)$('#end').classList.add('over');
+});
+main.addEventListener('dragleave',e=>{if(!main.contains(e.relatedTarget))clr()});
+main.addEventListener('drop',e=>{
+  if(!drag)return;e.preventDefault();const d=drag;drag=null;clr();
+  const st=e.target.closest('.step');let at=S.steps.length,idx=-1;
+  if(st){idx=+st.dataset.i;const r=st.getBoundingClientRect();at=e.clientY<r.top+r.height/2?idx:idx+1}
+  if(d.kind==='target'){
+    if(idx>=0){const s=S.steps[idx];if(s.t&&!s.t.includes(d.key))s.t.push(d.key);sel=idx}
+    else{S.steps.splice(at,0,newStep('set',[d.key]));sel=at}
+  }else if(d.kind==='action'){S.steps.splice(at,0,newStep(d.type,[],d.preset));sel=at}
+  else if(d.kind==='step'){const[m]=S.steps.splice(d.i,1);if(at>d.i)at--;S.steps.splice(at,0,m);sel=at}
+  render();
+});
+
+sync();pal();render();
+// Served by phadmin (same host, same login)? Load its rooms and lights automatically.
+fetch('/api/bridge/inventory',{credentials:'same-origin'}).then(r=>r.ok?r.json():Promise.reject()).then(d=>{
+  if(!d.success)return;loadBridge(d,true);pal();render();toast('Loaded rooms and lights from phadmin');
+}).catch(()=>{});
+</script>
+</body>
+</html>
