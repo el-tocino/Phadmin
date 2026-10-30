@@ -3,6 +3,17 @@ import json
 import secrets
 import logging
 import functools
+import re
+import ssl
+import time
+import hashlib
+import threading
+import http.client
+import sys
+import atexit
+import signal
+import tempfile
+import subprocess
 from datetime import timedelta
 from functools import wraps
 from flask import Flask, render_template_string, request, jsonify, redirect, session
@@ -19,7 +30,8 @@ DEFAULT_CONFIG = {
     "active_bridge": None,
     "bridges": {},   # {"ip_address": "username"}
     "secret_key": None,
-    "users": {}      # {"username": {"password_hash":..., "role": "admin"|"member", "rooms": [group_id,...]}}
+    "users": {},     # {"username": {"password_hash":..., "role": "admin"|"member", "rooms": [group_id,...]}}
+    "v2_pins": {}    # {"bridge_ip": "sha256 of the bridge's TLS certificate", set on first use}
 }
 
 
@@ -332,8 +344,171 @@ def summarize_sensors(raw):
                      value=', '.join(f'{k}: {v}' for k, v in extra.items()) or '-')
         d['readings'].append(r)
 
-    order = {'presence': 0, 'switch': 1, 'daylight': 2, 'temperature': 3, 'light': 4, 'generic': 5}
-    return sorted(devices.values(), key=lambda x: (order.get(x['kind'], 9), x['name'] or ''))
+    return sort_devices(list(devices.values()))
+
+
+SENSOR_ORDER = {'presence': 0, 'contact': 1, 'switch': 2, 'daylight': 3, 'temperature': 4, 'light': 5, 'generic': 6}
+
+
+def sort_devices(devices):
+    return sorted(devices, key=lambda d: (SENSOR_ORDER.get(d['kind'], 9), d['name'] or ''))
+
+
+# ==========================================
+# 3b. Hue v2 add-on: contact sensors
+# ==========================================
+# phue only speaks the v1 API, and the bridge doesn't expose the Hue Secure contact
+# sensor there. This is a small client for the v2 (CLIP v2) API, used only for that.
+# A v1 username works as the v2 "hue-application-key", so nothing needs re-pairing.
+V2_PORT = 443
+V2_TTL = 3             # seconds to reuse a snapshot (several browsers may be polling)
+V2_DEVICE_TTL = 60     # seconds to reuse a device's name/model
+V2_RETRY_AFTER = 600   # seconds before retrying a bridge that has no v2 API
+
+
+class V2Error(RuntimeError):
+    pass
+
+
+class V2Unsupported(V2Error):
+    """No v2 API here (old bridge or firmware). Not worth showing the user an error."""
+
+
+_v2_lock = threading.RLock()
+_v2_state = {}  # ip -> {'unsupported_until': ts, 'contacts': (ts, devices), 'devices': {rid: (ts, info)}}
+
+
+def v2_request(ip, key, method, path, body=None, timeout=5):
+    """One v2 call; returns the response's "data" list.
+    The bridge's certificate comes from a private CA, so normal verification can't work.
+    Instead its fingerprint is pinned the first time we connect (trust on first use)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection(ip, V2_PORT, timeout=timeout, context=ctx)
+    try:
+        try:
+            conn.connect()
+        except OSError as e:  # refused, timed out, or not speaking TLS
+            raise V2Unsupported(f'Hue v2 API not reachable ({e})')
+        fingerprint = hashlib.sha256(conn.sock.getpeercert(binary_form=True)).hexdigest()
+        pins = config.setdefault('v2_pins', {})
+        if ip not in pins:
+            pins[ip] = fingerprint
+            save_config(config)
+        elif pins[ip] != fingerprint:
+            raise V2Error("The bridge's security certificate changed since it was first trusted. If you reset "
+                          "the bridge, delete its entry under 'v2_pins' in config.json and restart.")
+        headers = {'hue-application-key': key}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body)
+            headers['Content-Type'] = 'application/json'
+        conn.request(method, f'/clip/v2/resource/{path}', payload, headers)
+        res = conn.getresponse()
+        raw = res.read()
+    finally:
+        conn.close()
+    if res.status == 404:
+        raise V2Unsupported('Hue v2 API not available on this bridge')
+    if res.status in (401, 403):
+        raise V2Error('The bridge rejected the application key for its v2 API')
+    try:
+        doc = json.loads(raw or b'{}')
+    except ValueError:
+        raise V2Error(f'Unexpected response from the bridge (HTTP {res.status})')
+    errors = doc.get('errors') or []
+    if res.status >= 400 or errors:
+        raise V2Error('; '.join(e.get('description', 'error') for e in errors) or f'Bridge returned HTTP {res.status}')
+    return doc.get('data') or []
+
+
+def _by_owner(items):
+    return {(i.get('owner') or {}).get('rid'): i for i in items if (i.get('owner') or {}).get('rid')}
+
+
+def _iso(ts):
+    """v2 stamps look like 2023-09-19T10:23:41.000Z; the UI expects v1's 2023-09-19T10:23:41 (UTC)."""
+    return ts.rstrip('Z').split('.')[0] if isinstance(ts, str) and ts else None
+
+
+def _device_info(ip, key, rid, st):
+    now = time.time()
+    hit = st.setdefault('devices', {}).get(rid)
+    if hit and now - hit[0] < V2_DEVICE_TTL:
+        return hit[1]
+    info = (v2_request(ip, key, 'GET', f'device/{rid}') or [{}])[0]
+    st['devices'][rid] = (now, info)
+    return info
+
+
+def _build_contact_devices(ip, key, st):
+    contacts = v2_request(ip, key, 'GET', 'contact')
+    if not contacts:
+        return []
+    tampers = _by_owner(v2_request(ip, key, 'GET', 'tamper'))
+    power = _by_owner(v2_request(ip, key, 'GET', 'device_power'))
+    link = _by_owner(v2_request(ip, key, 'GET', 'zigbee_connectivity'))
+
+    out = []
+    for c in contacts:
+        owner = (c.get('owner') or {}).get('rid')
+        dev = _device_info(ip, key, owner, st) if owner else {}
+        meta, prod = dev.get('metadata') or {}, dev.get('product_data') or {}
+
+        report = c.get('contact_report') or {}
+        state = report.get('state')  # "contact" = closed (magnet near), "no_contact" = open
+        is_open = state == 'no_contact'
+        stamps = [report.get('changed')]
+        readings = [{'id': c.get('id'), 'type': 'contact', 'v2': 'contact', 'enabled': c.get('enabled'),
+                     'settings': {}, 'label': 'Door / window', 'kind': 'contact', 'active': is_open,
+                     'value': 'Open' if is_open else ('Closed' if state == 'contact' else 'Unknown')}]
+
+        tamper = tampers.get(owner)
+        if tamper:
+            reports = tamper.get('tamper_reports') or []
+            tampered = any(r.get('state') == 'tampered' for r in reports)
+            stamps += [r.get('changed') for r in reports]
+            readings.append({'id': tamper.get('id'), 'type': 'tamper', 'v2': None, 'enabled': None, 'settings': {},
+                             'label': 'Tamper', 'kind': 'tamper', 'active': tampered,
+                             'value': 'Tampered' if tampered else 'OK'})
+
+        level = (power.get(owner) or {}).get('power_state', {}).get('battery_level')
+        battery = int(round(level)) if isinstance(level, (int, float)) and 0 <= level <= 100 else None
+        status = (link.get(owner) or {}).get('status')
+
+        out.append({'key': owner or c.get('id'), 'name': meta.get('name') or 'Contact sensor',
+                    'model': prod.get('product_name') or 'Hue secure contact sensor',
+                    'manufacturer': prod.get('manufacturer_name'), 'kind': 'contact', 'battery': battery,
+                    'reachable': None if not status else status == 'connected',
+                    'lastupdated': _iso(max((x for x in stamps if x), default=None)), 'readings': readings})
+    return out
+
+
+def contact_devices(b):
+    """-> (devices, notice). Never raises: contact sensors must not break the v1 sensor list.
+    A notice is only returned for problems worth showing (not for bridges that simply lack v2)."""
+    ip, key = b.ip, b.username
+    with _v2_lock:
+        st = _v2_state.setdefault(ip, {})
+        now = time.time()
+        if st.get('unsupported_until', 0) > now:
+            return [], None
+        hit = st.get('contacts')
+        if hit and now - hit[0] < V2_TTL:
+            return hit[1], None
+        try:
+            devices = _build_contact_devices(ip, key, st)
+        except V2Unsupported:
+            st['unsupported_until'] = now + V2_RETRY_AFTER
+            return [], None
+        except V2Error as e:
+            return [], f'Contact sensors unavailable: {e}'
+        except Exception as e:
+            logging.warning(f'Contact sensor lookup failed: {e}')
+            return [], f'Contact sensors unavailable: {e}'
+        st['contacts'] = (now, devices)
+        return devices, None
 
 
 # ==========================================
@@ -405,11 +580,12 @@ MACROS = """
 
 HTML_TEMPLATE = MACROS + """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en"{% if tab == 'scenes' %} data-theme="dark"{% endif %}>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Hue Admin</title>
+<script>try{var t=localStorage.theme;if(t)document.documentElement.dataset.theme=t}catch(e){}</script>
 {% raw %}
 <style>
 :root {
@@ -484,7 +660,7 @@ details summary { cursor:pointer; color:var(--muted); font-size:.85rem; margin-t
 .reading .rl { color:var(--muted); font-size:.82rem; width:92px; flex:none; }
 .reading .rv { flex:1; font-weight:600; }
 .reading .rv small { color:var(--muted); font-weight:500; }
-.motion-on { color:var(--ok); }
+.motion-on { color:var(--ok); } .state-open { color:#e8a317; } .state-bad { color:var(--danger); }
 .setting { display:flex; align-items:center; gap:10px; padding:6px 0 6px 102px; font-size:.82rem; color:var(--muted); }
 .setting input[type=range] { flex:1; max-width:140px; }
 .empty { text-align:center; color:var(--muted); padding:40px 0; }
@@ -504,6 +680,11 @@ body:has(dialog[open]) { overflow:hidden; }
 .scene-save { display:flex; gap:10px; } .scene-save input { flex:1; }
 .scene-list { margin-top:12px; display:flex; flex-direction:column; gap:8px; max-height:260px; overflow:auto; }
 .scene-row { display:flex; align-items:center; justify-content:space-between; gap:10px; background:var(--surface); border:1px solid var(--border); border-radius:12px; padding:8px 12px; }
+[hidden] { display:none !important; }
+.progress { height:8px; border-radius:99px; background:var(--surface-2); overflow:hidden; margin-top:16px; }
+.progress span { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--primary),#ff5f8d); transition:width .8s linear; }
+.found-row { display:flex; align-items:center; gap:10px; background:var(--surface-2); border:1px solid var(--border); border-radius:12px; padding:8px 10px; margin-top:8px; }
+.found-row input { flex:1; background:var(--surface); }
 </style>
 {% endraw %}
 </head>
@@ -511,7 +692,7 @@ body:has(dialog[open]) { overflow:hidden; }
 <header><div class="bar">
   <div class="brand"><i></i> Hue Admin</div>
   <nav>
-    {% for key, label, adminOnly in [('lights','Lights',False),('groups','Groups',False),('sensors','Sensors',True),('bridges','Bridges',True),('settings','Schedules',True),('users','Users',True)] %}
+    {% for key, label, adminOnly in [('lights','Lights',False),('groups','Groups',False),('scenes','Scene editor',True),('sensors','Sensors',True),('bridges','Bridges',True),('settings','Schedules',True),('users','Users',True)] %}
     {% if not adminOnly or user.role == 'admin' %}
     <a href="/?tab={{ key }}" class="{{ 'active' if tab == key }}">{{ label }}</a>
     {% endif %}
@@ -552,6 +733,20 @@ body:has(dialog[open]) { overflow:hidden; }
   </div>
   {% endfor %}
 </div>
+
+{% if config.active_bridge %}
+<div class="card" id="scan-card" style="margin-top:20px;">
+  <div class="head"><div class="dot">📡</div>
+    <div class="t"><h3>Find new devices</h3><div class="muted">Searches on the active bridge, {{ config.active_bridge }}</div></div></div>
+  <p class="muted" style="margin:8px 0 0;">Power on the new light, or put the switch/sensor in pairing mode, and keep it close to the bridge. A scan takes about a minute. Devices that were paired to another bridge may need a factory reset first.</p>
+  <div class="inline" style="margin-top:14px;max-width:520px;">
+    <select id="scan-kind" aria-label="Device type"><option value="lights">Lights</option><option value="sensors">Sensors &amp; switches</option></select>
+    <button class="btn" id="scan-btn" type="button" style="white-space:nowrap">Scan for new devices</button>
+  </div>
+  <div id="scan-progress" hidden><div class="progress"><span id="scan-bar"></span></div><div class="muted" id="scan-msg" style="margin-top:6px;"></div></div>
+  <div id="scan-results"></div>
+</div>
+{% endif %}
 {% endif %}
 
 {% if tab == 'lights' %}
@@ -603,7 +798,7 @@ body:has(dialog[open]) { overflow:hidden; }
 
 {% if tab == 'sensors' %}
 <div style="display:flex;align-items:flex-end;justify-content:space-between;flex-wrap:wrap;gap:10px;">
-  <div><h2>Sensors &amp; controls</h2><p class="sub">Motion, temperature, light level, daylight and switches. Live, refreshes every 5 seconds.</p></div>
+  <div><h2>Sensors &amp; controls</h2><p class="sub">Motion, door/window contact, temperature, light level, daylight and switches. Live, refreshes every 5 seconds.</p></div>
   <div class="inline" style="margin-bottom:18px;"><button class="btn ghost" id="unit-btn">°C / °F</button></div>
 </div>
 <div class="grid" id="sensor-grid"><div class="empty">Loading sensors…</div></div>
@@ -672,6 +867,96 @@ body:has(dialog[open]) { overflow:hidden; }
     </form>
   </div>
   {% endfor %}
+</div>
+{% endif %}
+
+{% if tab == 'scenes' %}
+<style>
+{% raw %}
+#se .se-bar{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-bottom:18px}
+#se .sp{flex:1}
+#se select,#se input[type=number],#se input[type=text]{width:auto}
+#se #se-name{min-width:18ch;font-weight:600}
+#se button:disabled{opacity:.5;cursor:not-allowed}
+.se-app{display:grid;grid-template-columns:260px minmax(0,1fr);gap:22px;align-items:start}
+@media(max-width:820px){.se-app{grid-template-columns:1fr}}
+#se-pal h4{margin:18px 0 8px;font-size:.95rem}
+#se-pal h4:first-child{margin-top:0}
+#se .list{display:flex;flex-wrap:wrap;gap:6px}
+#se .obj{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;background:var(--surface);border:1px solid var(--border);cursor:grab;user-select:none;font-size:.88rem}
+#se .obj.g{border-radius:6px;border-left:4px solid var(--ok)}
+#se .obj.l{border-radius:99px;border-left:4px solid var(--glow)}
+#se .obj.miss{border-style:dashed}
+#se .obj i{font-style:normal;cursor:pointer;color:var(--muted)}
+#se .obj i:hover{color:var(--danger)}
+#se .act{display:flex;gap:10px;align-items:center;padding:8px 10px;margin-bottom:6px;background:var(--surface);border:1px solid var(--border);border-radius:10px;cursor:grab}
+#se .act>span{font-size:1.3rem}
+#se .step{position:relative;margin:0 0 12px 36px;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:10px 14px;box-shadow:var(--shadow)}
+#se .step::before{content:"";position:absolute;left:-25px;top:0;bottom:-13px;border-left:2px solid var(--border)}
+#se .step::after{content:attr(data-n);position:absolute;left:-36px;top:9px;width:22px;height:22px;border-radius:50%;background:var(--primary);color:var(--primary-fg);font-size:.75rem;font-weight:700;display:grid;place-items:center}
+#se .step.sel{border-color:var(--primary)}
+#se .step.mb{box-shadow:0 -4px 0 var(--primary)}
+#se .step.ma{box-shadow:0 4px 0 var(--primary)}
+#se .sh{display:flex;align-items:center;gap:8px}
+#se .grip{cursor:grab;color:var(--muted);font-size:1.1rem;padding:0 4px}
+#se .x{border:0;background:none;color:var(--muted);cursor:pointer;font-size:1rem}
+#se .x:hover{color:var(--danger)}
+#se .tz{display:flex;flex-wrap:wrap;gap:6px;align-items:center;min-height:38px;margin:8px 0 2px;padding:6px;border:1px dashed var(--border);border-radius:8px}
+#se .tz.over{border-color:var(--primary);background:color-mix(in srgb,var(--primary) 10%,transparent)}
+#se .f{display:flex;gap:10px;align-items:center;margin-top:8px}
+#se .f>label{width:84px;flex:none;color:var(--muted)}
+#se .c{display:flex;flex-wrap:wrap;gap:8px;align-items:center;flex:1}
+#se input[type=number]{width:80px}
+#se .dur{display:inline-flex;gap:4px}
+#se input[type=range]{width:170px}
+#se input.kel{background:linear-gradient(90deg,#ffb457,#fff 50%,#9fc4ff)}
+#se output{min-width:5ch;font-variant-numeric:tabular-nums}
+#se .sws{display:inline-flex;gap:6px;align-items:center;flex-wrap:wrap}
+#se .sw{width:22px;height:22px;border-radius:50%;box-shadow:0 0 0 1px var(--border);border:2px solid var(--surface);cursor:pointer;display:inline-block}
+#se .chk{display:flex;gap:6px;align-items:center}
+#se-end{margin-left:36px;padding:18px;text-align:center;border:2px dashed var(--border);border-radius:12px;color:var(--muted)}
+#se-end.over{border-color:var(--primary);color:var(--text)}
+#se-pvw{margin:18px 0 0 36px}
+#se-pvw h4{margin:0 0 8px;font-size:.95rem}
+#se .prow{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+#se-log{margin:10px 0 0;max-height:280px;overflow:auto;padding:8px;background:var(--surface);border:1px solid var(--border);border-radius:8px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
+#se details{margin:16px 0 0 36px}
+#se textarea{width:100%;height:240px;margin-top:8px;padding:8px;background:var(--surface);color:var(--text);border:1px solid var(--border);border-radius:8px;font:12px/1.4 ui-monospace,Menlo,Consolas,monospace}
+{% endraw %}
+</style>
+<h2>Scene editor</h2>
+<p class="sub">Build timed sequences from the rooms and lights on {{ config.active_bridge }}. Export them, or preview them here with the runner.</p>
+<div id="se">
+  <div class="se-bar">
+    <input id="se-name" type="text" aria-label="Scene name" placeholder="Scene name">
+    <label class="muted">Repeat <select id="se-rm"><option value="once">once</option><option value="count">N times</option><option value="forever">forever</option></select></label>
+    <input id="se-rc" type="number" min="2" value="2" aria-label="Repeat count" hidden>
+    <span class="sp"></span>
+    <button class="btn ghost" id="se-new" type="button">New</button>
+    <button class="btn ghost" id="se-imp" type="button">Open scene</button>
+    <button class="btn" id="se-exp" type="button">Export</button>
+    <input type="file" id="se-fi" accept=".json,application/json" hidden>
+  </div>
+  <div class="se-app">
+    <aside id="se-pal"></aside>
+    <div id="se-main">
+      <div id="se-tl"></div>
+      <div id="se-end">Drag an action here, or drop a room or light to start a step</div>
+      <section id="se-pvw">
+        <h4>Preview with the runner</h4>
+        <div class="prow">
+          <button class="btn ghost" id="se-dry" type="button">Dry run</button>
+          <button class="btn" id="se-play" type="button">Play on lights</button>
+          <button class="btn ghost" id="se-stop" type="button" disabled>Stop</button>
+          <label class="muted">Speed <select id="se-spd"><option>1</option><option>2</option><option>5</option><option>10</option><option>30</option></select>&times;</label>
+          <label class="chk muted"><input type="checkbox" id="se-once" checked> One pass only</label>
+        </div>
+        <p class="muted">Dry run sends nothing. Play changes your real lights and leaves them as the scene ends.</p>
+        <pre id="se-log" hidden></pre>
+      </section>
+      <details><summary>JSON preview</summary><textarea id="se-pv" readonly aria-label="Export preview"></textarea></details>
+    </div>
+  </div>
 </div>
 {% endif %}
 
@@ -769,6 +1054,69 @@ document.querySelectorAll('[data-delete]').forEach(b => b.addEventListener('clic
   if (confirm(b.dataset.confirm || 'Are you sure?') && await post(b.dataset.delete, {})) location.reload();
 }));
 
+// Device scan (Bridges tab)
+const scanCard = $('#scan-card');
+if (scanCard) {
+  const btn = $('#scan-btn'), kindSel = $('#scan-kind'), prog = $('#scan-progress');
+  const bar = $('#scan-bar'), msg = $('#scan-msg'), results = $('#scan-results');
+  const SCAN_MS = 60000;   // a Hue search runs ~40-60s
+  let pollTimer = null, startedAt = 0, lastKind = 'lights';
+
+  function renderResults(o, kind) {
+    const label = kind === 'sensors' ? 'sensors & switches' : 'lights';
+    let h = '';
+    if (o.found.length) {
+      h += `<h3 class="gm-h">New ${label} found (${o.found.length})</h3>`;
+      h += o.found.map(f => `<div class="found-row" data-id="${esc(f.id)}"><input type="text" maxlength="32" value="${esc(f.name)}" aria-label="Device name"><button class="btn ghost" type="button" data-rename>Rename</button></div>`).join('');
+      h += `<p class="muted" style="margin-top:10px;">${kind === 'lights' ? 'They are on the Lights tab now. Add them to a room with Groups → Edit group.' : 'They now appear on the Sensors tab.'}</p>`;
+    } else if (!o.scanning) {
+      h += `<p class="muted" style="margin-top:14px;">No new ${label} found. Check that the device is powered on (or in pairing mode) and close to the bridge, then scan again.</p>`;
+    }
+    if (!o.scanning && o.lastscan && o.lastscan !== 'none' && o.lastscan !== 'active') {
+      const t = new Date(o.lastscan + 'Z');
+      h += `<p class="muted">Scan finished ${isNaN(t) ? esc(o.lastscan) : esc(t.toLocaleString())}.</p>`;
+    }
+    results.innerHTML = h;
+  }
+  function setBusy(busy) { btn.disabled = busy; kindSel.disabled = busy; btn.textContent = busy ? 'Scanning…' : 'Scan for new devices'; }
+  function finish(o, kind) {
+    clearTimeout(pollTimer); setBusy(false);
+    bar.style.width = '100%'; setTimeout(() => { prog.hidden = true; bar.style.width = '0'; }, 800);
+    renderResults(o, kind);
+    toast(o.found.length ? `Found ${o.found.length} new device${o.found.length > 1 ? 's' : ''}` : 'Scan finished: nothing new');
+  }
+  async function poll(kind) {
+    try {
+      const o = await getJSON(`/api/bridge/scan/status?kind=${kind}`);
+      const elapsed = Date.now() - startedAt;
+      // the bridge can take a moment to flip to "active", so don't trust an early "not scanning"
+      if ((o.scanning || elapsed < 5000) && elapsed < SCAN_MS * 2) {
+        bar.style.width = Math.min(95, 3 + elapsed / SCAN_MS * 92) + '%';
+        msg.textContent = `Scanning… ${Math.round(elapsed / 1000)}s (usually 40–60s)`;
+        if (o.found.length) renderResults(o, kind);
+        pollTimer = setTimeout(() => poll(kind), 3000);
+      } else finish(o, kind);
+    } catch (e) { clearTimeout(pollTimer); setBusy(false); prog.hidden = true; toast(e.message, true); }
+  }
+  function begin(kind) {
+    lastKind = kind; startedAt = Date.now(); setBusy(true); prog.hidden = false; bar.style.width = '3%';
+    msg.textContent = 'Starting scan…'; clearTimeout(pollTimer); pollTimer = setTimeout(() => poll(kind), 1500);
+  }
+  btn.onclick = async () => {
+    const kind = kindSel.value; results.innerHTML = '';
+    btn.disabled = true;
+    if (await post('/api/bridge/scan', { kind })) begin(kind); else btn.disabled = false;
+  };
+  results.addEventListener('click', async e => {
+    const b = e.target.closest('[data-rename]'); if (!b) return;
+    const row = b.closest('[data-id]'), name = $('input', row).value.trim();
+    if (!name) { toast('Enter a name', true); return; }
+    if (await post(`/api/device/${lastKind}/${row.dataset.id}/rename`, { name })) toast('Renamed');
+  });
+  // If a scan is already running (e.g. page was reloaded mid-scan), pick it back up
+  getJSON('/api/bridge/scan/status?kind=lights').then(o => { if (o.scanning) { kindSel.value = 'lights'; begin('lights'); } }).catch(() => {});
+}
+
 // Group modal: live light status + scenes
 const gm = $('#group-modal');
 if (gm) {
@@ -841,15 +1189,15 @@ document.addEventListener('click', e => {
 const sg = $('#sensor-grid');
 if (sg) {
   let useF = localStorage.unit === 'F';
-  const icons = { presence: '🚶', temperature: '🌡️', light: '☀️', switch: '🎛️', daylight: '🌅', generic: '📟' };
-  let devices = [];
+  const icons = { presence: '🚶', temperature: '🌡️', light: '☀️', switch: '🎛️', daylight: '🌅', contact: '🚪', generic: '📟' };
+  let devices = [], notice = '';
   const ago = iso => {
     if (!iso) return 'never';
     const s = Math.max(0, (Date.now() - new Date(iso + 'Z')) / 1000);
     if (s < 60) return 'just now'; if (s < 3600) return Math.floor(s / 60) + 'm ago';
     if (s < 86400) return Math.floor(s / 3600) + 'h ago'; return Math.floor(s / 86400) + 'd ago';
   };
-  const toggle = (sid, cfg, on) => `<label class="switch"><input type="checkbox" data-sensor="${sid}" data-cfg="${cfg}" ${on ? 'checked' : ''}><span></span></label>`;
+  const toggle = (sid, cfg, on, v2) => `<label class="switch"><input type="checkbox" data-sensor="${sid}" data-cfg="${cfg}" data-v2="${v2 || ''}" ${on ? 'checked' : ''}><span></span></label>`;
   function readingHTML(r) {
     let val = '';
     if (r.kind === 'temperature') {
@@ -858,8 +1206,12 @@ if (sg) {
       val = r.lux == null ? '–' : `${r.lux} lx <small>${r.dark ? 'dark' : r.daylight ? 'daylight' : ''}</small>`;
     } else if (r.kind === 'presence') {
       val = `<span class="${r.active ? 'motion-on' : ''}">${r.active ? '● ' : '○ '}${esc(r.value)}</span>`;
+    } else if (r.kind === 'contact') {
+      val = `<span class="${r.active ? 'state-open' : ''}">${r.active ? '● ' : '○ '}${esc(r.value)}</span>`;
+    } else if (r.kind === 'tamper') {
+      val = `<span class="${r.active ? 'state-bad' : ''}">${esc(r.value)}</span>`;
     } else val = esc(r.value);
-    let html = `<div class="reading"><span class="rl">${esc(r.label)}</span><span class="rv">${val}</span>${r.enabled != null ? toggle(r.id, 'on', r.enabled) : ''}</div>`;
+    let html = `<div class="reading"><span class="rl">${esc(r.label)}</span><span class="rv">${val}</span>${r.enabled != null ? toggle(r.id, 'on', r.enabled, r.v2) : ''}</div>`;
     if (r.settings.sensitivity) {
       const s = r.settings.sensitivity;
       html += `<div class="setting">Sensitivity <input type="range" min="0" max="${s.max}" value="${s.value}" data-sensor="${r.id}" data-cfg="sensitivity"> <b>${s.value}/${s.max}</b></div>`;
@@ -868,8 +1220,9 @@ if (sg) {
     return html;
   }
   function render() {
-    if (!devices.length) { sg.innerHTML = '<div class="empty">No sensors found on this bridge.</div>'; return; }
-    sg.innerHTML = devices.map(d => `
+    const banner = notice ? `<div class="alert" style="grid-column:1/-1;margin:0">${esc(notice)}</div>` : '';
+    if (!devices.length) { sg.innerHTML = banner + '<div class="empty">No sensors found on this bridge.</div>'; return; }
+    sg.innerHTML = banner + devices.map(d => `
       <div class="card"><div class="head"><div class="dot">${icons[d.kind] || icons.generic}</div>
         <div class="t"><h3>${esc(d.name)}</h3><div class="muted">${esc(d.model)} · updated ${ago(d.lastupdated)}</div></div>
         ${d.battery != null ? `<span class="pill ${d.battery < 20 ? 'bad' : 'ok'}">🔋 ${d.battery}%</span>` : ''}
@@ -878,19 +1231,255 @@ if (sg) {
   }
   async function refresh() {
     if (document.activeElement && document.activeElement.type === 'range' && sg.contains(document.activeElement)) return;
-    try { devices = (await getJSON('/api/sensors')).devices; render(); }
+    try { const o = await getJSON('/api/sensors'); devices = o.devices; notice = o.notice || ''; render(); }
     catch (e) { sg.innerHTML = `<div class="alert">${esc(e.message)}</div>`; }
   }
   sg.addEventListener('change', async e => {
     const el = e.target; if (!el.dataset.sensor) return;
     const v = el.type === 'checkbox' ? el.checked : Number(el.value);
-    if (await post(`/api/sensor/${el.dataset.sensor}/config`, { [el.dataset.cfg]: v })) { toast('Saved'); refresh(); }
+    const v2 = el.dataset.v2;   // contact sensors live on the bridge's v2 API
+    const url = v2 ? `/api/v2/${v2}/${el.dataset.sensor}` : `/api/sensor/${el.dataset.sensor}/config`;
+    if (await post(url, v2 ? { enabled: v } : { [el.dataset.cfg]: v })) { toast('Saved'); refresh(); }
   });
   $('#unit-btn').onclick = () => { useF = !useF; localStorage.unit = useF ? 'F' : 'C'; render(); };
   refresh(); setInterval(refresh, 5000);
 }
 </script>
 {% endraw %}
+{% if tab == 'scenes' %}
+<script type="application/json" id="se-data">{{ inventory|tojson }}</script>
+<script>
+{% raw %}
+(function(){
+'use strict';
+// Uses phadmin's own $, esc, toast, post and getJSON. Rooms and lights come from the server (active bridge).
+const DATA=JSON.parse($('#se-data').textContent);
+const byName=(a,b)=>a.name.localeCompare(b.name);
+const T={l:Object.entries(DATA.lights).map(([id,x])=>({id,name:x.name||'Light '+id})).sort(byName),
+  g:Object.entries(DATA.groups).map(([id,x])=>({id,name:x.name||'Group '+id,lights:x.lights||[]})).sort(byName)};
+const X={};  // targets from an opened file that this bridge doesn't have
+const TITLES={set:'Set state',fade:'Dim / brighten',wait:'Timer'};
+const fresh=()=>({name:'My scene',repeat:{mode:'once',count:2},steps:[]});
+const DRAFT='phadmin-scene-draft';
+let S=fresh(),sel=-1,drag=null;
+try{const d=JSON.parse(localStorage.getItem(DRAFT));if(d&&Array.isArray(d.steps)&&d.repeat)S=d}catch(_){}
+const save=()=>{try{localStorage.setItem(DRAFT,JSON.stringify(S))}catch(_){}};
+const key=(k,o)=>k+':'+(o.id||'name:'+o.name);
+const find=k=>(k[0]==='g'?T.g:T.l).find(o=>key(k[0],o)===k)||X[k];
+const inLib=k=>(k[0]==='g'?T.g:T.l).some(o=>key(k[0],o)===k);
+const nameOf=k=>{const o=find(k);return o?o.name:k.replace(/^[gl]:(name:)?/,'')};
+const setP=(o,p,v)=>{const a=p.split('.');while(a.length>1)o=o[a.shift()];o[a[0]]=v};
+
+function newStep(type,t=[],preset){
+  if(type==='set'){const rc=preset==='randcolor';return{type,t,power:rc?'keep':'on',bm:'keep',bri:100,color:{mode:rc?'list':'keep',hex:'#ff8800',kelvin:2700,hexes:rc?['#ff3b30','#34c759','#0a84ff','#ffcc00']:[]}}}
+  if(type==='fade')return{type,t,fm:'current',from:100,to:0,secs:600,wait:true};
+  return{type:'wait',mode:preset==='randwait'?'random':'fixed',secs:5,min:2,max:10};
+}
+
+/* ---------- step controls ---------- */
+const opts=(cur,a)=>a.map(([v,l])=>`<option value="${v}"${v===cur?' selected':''}>${l}</option>`).join('');
+const row=(l,i)=>`<div class="f"><label>${l}</label><div class="c">${i}</div></div>`;
+const sl=(k,v,min,max,step,cls,txt)=>`<input type="range" class="${cls}" data-k="${k}" min="${min}" max="${max}" step="${step}" value="${v}"><output>${txt}</output>`;
+const dur=(k,v)=>{const m=v>=60&&v%30===0;return`<span class="dur" data-dk="${k}"><input type="number" min="0" step="any" value="${m?v/60:v}" aria-label="Duration"><select aria-label="Unit"><option value="1">sec</option><option value="60"${m?' selected':''}>min</option></select></span>`};
+const colorCtl=c=>c.mode==='fixed'?`<input type="color" data-k="color.hex" value="${esc(c.hex)}" aria-label="Color">`
+  :c.mode==='white'?sl('color.kelvin',c.kelvin,2000,6500,100,'kel',c.kelvin+' K')
+  :c.mode==='list'?`<span class="sws">${c.hexes.map((h,j)=>`<i class="sw" style="background:${esc(h)}" data-rs="${j}" title="Remove this color"></i>`).join('')}<input type="color" value="#ff3b30" aria-label="Color to add"><button class="btn ghost" data-addc type="button">+ add</button></span>`
+  :c.mode==='any'?'<span class="muted">A new random color each time</span>':'';
+function body(s){
+  if(s.type==='wait')return row('Pause',`<select data-k="mode">${opts(s.mode,[['fixed','for a set time'],['random','for a random time']])}</select>`)
+    +(s.mode==='random'?row('Between',dur('min',s.min)+' and '+dur('max',s.max)):row('Duration',dur('secs',s.secs)));
+  if(s.type==='fade')return row('From',`<select data-k="fm">${opts(s.fm,[['current','current brightness'],['set','a set brightness']])}</select>`+(s.fm==='set'?sl('from',s.from,0,100,1,'',s.from+'%'):''))
+    +row('To',sl('to',s.to,0,100,1,'',s.to+'%')+'<span class="muted">0% turns the light off at the end</span>')
+    +row('Over',dur('secs',s.secs))
+    +row('',`<label class="chk"><input type="checkbox" data-k="wait"${s.wait?' checked':''}> Wait until finished before the next step</label>`);
+  const c=s.color;
+  return row('Power',`<select data-k="power">${opts(s.power,[['keep','No change'],['on','Turn on'],['off','Turn off']])}</select>`)
+    +row('Brightness',`<select data-k="bm">${opts(s.bm,[['keep','No change'],['set','Set to…']])}</select>`+(s.bm==='set'?sl('bri',s.bri,1,100,1,'',s.bri+'%'):''))
+    +row('Color',`<select data-k="color.mode">${opts(c.mode,[['keep','No change'],['fixed','Color'],['white','White, warm to cool'],['list','Random from my colors'],['any','Any random color']])}</select>`+colorCtl(c));
+}
+
+/* ---------- rendering ---------- */
+function render(){
+  $('#se-tl').innerHTML=S.steps.map((s,i)=>`<div class="step${sel===i?' sel':''}" data-i="${i}" data-n="${i+1}">
+    <div class="sh"><span class="grip" draggable="true" data-drag="step" data-i="${i}" title="Drag to reorder">⠿</span><b>${TITLES[s.type]}</b><span class="sp"></span><button class="x" data-del type="button" title="Delete step" aria-label="Delete step">✕</button></div>
+    ${s.t?`<div class="tz">${s.t.map(k=>`<span class="obj ${k[0]}${inLib(k)?'':' miss'}"${inLib(k)?'':' title="Not found on this bridge"'}>${k[0]==='g'?'🛋️':'💡'} ${inLib(k)?'':'⚠ '}${esc(nameOf(k))}<i data-rt="${esc(k)}" title="Remove">×</i></span>`).join('')||'<span class="muted">Drop rooms or lights here</span>'}</div>`:''}
+    ${body(s)}</div>`).join('');
+  preview();
+}
+function pal(){
+  const ch=(k,o)=>`<span class="obj ${k}" draggable="true" data-drag="target" data-key="${esc(key(k,o))}">${k==='g'?'🛋️':'💡'} ${esc(o.name)}</span>`;
+  const acts=[['set','','🎚️','Set state','On/off, brightness, color'],['fade','','🌗','Dim / brighten','Fade over time'],['wait','','⏱️','Timer','Pause the sequence'],['wait','randwait','🎲','Random timer','Pause for a random time'],['set','randcolor','🌈','Random color','Pick a color at random']];
+  const none='<span class="muted">none on this bridge</span>';
+  $('#se-pal').innerHTML=`<h4>Rooms &amp; zones</h4><div class="list">${T.g.map(o=>ch('g',o)).join('')||none}</div>
+    <h4>Lights</h4><div class="list">${T.l.map(o=>ch('l',o)).join('')||none}</div>
+    <h4>Actions</h4>${acts.map(([t,p,i,n,d])=>`<div class="act" draggable="true" data-drag="action" data-type="${t}" data-preset="${p}"><span>${i}</span><div><b>${n}</b><div class="muted">${d}</div></div></div>`).join('')}
+    <p class="muted">Drag onto the timeline, or click. Drop a room or light onto a step to aim it there.</p>`;
+}
+const sync=()=>{$('#se-name').value=S.name;$('#se-rm').value=S.repeat.mode;$('#se-rc').value=S.repeat.count;$('#se-rc').hidden=S.repeat.mode!=='count'};
+
+/* ---------- export / open ---------- */
+function build(){
+  const used=new Set();S.steps.forEach(s=>(s.t||[]).forEach(k=>used.add(k)));
+  const targets={};used.forEach(k=>{const o=find(k);targets[k]=Object.assign({type:k[0]==='g'?'group':'light',name:nameOf(k)},o&&o.id?{id:o.id}:{},o&&o.lights?{lights:o.lights}:{})});
+  const steps=S.steps.map(s=>{
+    if(s.type==='wait')return s.mode==='random'?{type:'wait',random:{min:s.min,max:Math.max(s.min,s.max)}}:{type:'wait',seconds:s.secs};
+    if(s.type==='fade')return{type:'fade',targets:s.t,from:s.fm==='set'?s.from:'current',to:s.to,seconds:s.secs,wait:s.wait};
+    const o={type:'set',targets:s.t},c=s.color;
+    if(s.power!=='keep')o.power=s.power;
+    if(s.bm==='set')o.brightness=s.bri;
+    if(c.mode==='fixed')o.color={mode:'fixed',hex:c.hex};
+    else if(c.mode==='white')o.color={mode:'white',kelvin:c.kelvin,mirek:Math.max(153,Math.min(500,Math.round(1e6/c.kelvin)))};
+    else if(c.mode==='list')o.color={mode:'random_choice',hexes:c.hexes};
+    else if(c.mode==='any')o.color={mode:'random_any'};
+    return o;
+  });
+  const r=S.repeat;
+  return{format:'hue-scene-sequence',version:1,name:S.name,repeat:r.mode==='count'?{mode:'count',count:r.count}:{mode:r.mode},targets,steps,
+    notes:'Steps run in order. Brightness is 0-100%. Colors are sRGB hex; white uses kelvin (mirek = 1,000,000 / kelvin). A fade to 0% turns the light off at the end. A fade with wait=false lets the next step start straight away. Random choices are made fresh each time a step runs. A group target applies to all its lights.'};
+}
+const preview=()=>{$('#se-pv').value=JSON.stringify(build(),null,2);save()};
+function check(){
+  if(!S.steps.length)return'Add at least one step first.';
+  for(const[i,s]of S.steps.entries()){
+    if(s.t&&!s.t.length)return`Step ${i+1} needs a room or light. Drop one onto it.`;
+    if(s.type==='set'&&s.color.mode==='list'&&!s.color.hexes.length)return`Step ${i+1}: add at least one color to pick from.`;
+    if(s.type==='set'&&s.power==='keep'&&s.bm==='keep'&&s.color.mode==='keep')return`Step ${i+1} changes nothing. Choose power, brightness or color.`;
+  }
+  return'';
+}
+function fromJSON(o){
+  if(!o||o.format!=='hue-scene-sequence')throw new Error('That file is not a Hue scene export.');
+  const map={};
+  for(const[k,v]of Object.entries(o.targets||{})){
+    const kind=v.type==='group'?'g':'l',list=kind==='g'?T.g:T.l;
+    const live=list.find(x=>v.id&&x.id===v.id)||list.find(x=>x.name.toLowerCase()===(v.name||'').toLowerCase());
+    if(live)map[k]=key(kind,live);
+    else{const x={name:v.name,id:v.id,lights:v.lights},nk=key(kind,x);X[nk]=x;map[k]=nk}
+  }
+  S.name=o.name||'Imported scene';const r=o.repeat||{};S.repeat={mode:r.mode||'once',count:r.count||2};
+  S.steps=(o.steps||[]).map(x=>{
+    const t=(x.targets||[]).map(k=>map[k]||k);
+    if(x.type==='wait'){const s=newStep('wait');if(x.random){s.mode='random';s.min=x.random.min;s.max=x.random.max}else s.secs=x.seconds??5;return s}
+    if(x.type==='fade'){const s=newStep('fade',t);s.fm=typeof x.from==='number'?'set':'current';if(s.fm==='set')s.from=x.from;s.to=x.to??0;s.secs=x.seconds??60;s.wait=x.wait!==false;return s}
+    const s=newStep('set',t),c=x.color||{};
+    s.power=x.power||'keep';s.bm=x.brightness!=null?'set':'keep';if(x.brightness!=null)s.bri=x.brightness;
+    s.color.mode={fixed:'fixed',white:'white',random_choice:'list',random_any:'any'}[c.mode]||'keep';
+    if(c.hex)s.color.hex=c.hex;if(c.kelvin)s.color.kelvin=c.kelvin;if(c.hexes)s.color.hexes=c.hexes;
+    return s;
+  });
+  sel=-1;
+}
+$('#se-fi').addEventListener('change',async e=>{
+  const inp=e.target,f=inp.files[0];inp.value='';if(!f)return;
+  try{fromJSON(JSON.parse(await f.text()));sync();pal();render();toast('Scene opened')}catch(err){toast(err.message||'Could not read that file.',true)}
+});
+$('#se-imp').onclick=()=>$('#se-fi').click();
+$('#se-new').onclick=()=>{if(S.steps.length&&!confirm('Start a new scene? Unsaved steps will be lost.'))return;S=fresh();sel=-1;sync();render()};
+$('#se-exp').onclick=()=>{
+  const m=check();if(m){toast(m,true);return}
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(build(),null,2)],{type:'application/json'}));
+  a.download=((S.name||'scene').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'')||'scene')+'.hue-scene.json';
+  document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);toast('Exported '+a.download);
+};
+$('#se-name').oninput=e=>{S.name=e.target.value;preview()};
+$('#se-rm').onchange=e=>{S.repeat.mode=e.target.value;sync();preview()};
+$('#se-rc').oninput=e=>{S.repeat.count=Math.max(2,+e.target.value||2);preview()};
+
+/* ---------- editing steps ---------- */
+function onEdit(e){
+  const el=e.target,st=el.closest('.step');if(!st)return;
+  const s=S.steps[+st.dataset.i],d=el.closest('.dur');
+  if(d){setP(s,d.dataset.dk,Math.max(0,(parseFloat(d.querySelector('input').value)||0)*parseFloat(d.querySelector('select').value)));preview();return}
+  const k=el.dataset.k;if(!k)return;
+  const v=el.type==='checkbox'?el.checked:(el.type==='range'||el.type==='number')?+el.value:el.value;
+  setP(s,k,v);
+  if(el.type==='range'){const o=el.parentNode.querySelector('output');if(o)o.textContent=v+(k.endsWith('kelvin')?' K':'%')}
+  if(el.tagName==='SELECT'&&e.type==='change')render();else preview();
+}
+$('#se-tl').addEventListener('input',onEdit);
+$('#se-tl').addEventListener('change',onEdit);
+$('#se-tl').addEventListener('click',e=>{
+  const st=e.target.closest('.step');if(!st)return;
+  const i=+st.dataset.i,s=S.steps[i];let a;
+  if(e.target.closest('[data-del]')){S.steps.splice(i,1);sel=-1;render();return}
+  if(a=e.target.closest('[data-rt]')){s.t=s.t.filter(k=>k!==a.dataset.rt);render();return}
+  if(a=e.target.closest('[data-rs]')){s.color.hexes.splice(+a.dataset.rs,1);render();return}
+  if(a=e.target.closest('[data-addc]')){s.color.hexes.push(a.previousElementSibling.value);render();return}
+  if(sel!==i){sel=i;document.querySelectorAll('#se .step').forEach(x=>x.classList.toggle('sel',+x.dataset.i===i))}
+});
+$('#se-pal').addEventListener('click',e=>{
+  let a;
+  if(a=e.target.closest('[data-drag="target"]')){
+    const s=S.steps[sel];
+    if(s&&s.t){if(!s.t.includes(a.dataset.key))s.t.push(a.dataset.key)}else{S.steps.push(newStep('set',[a.dataset.key]));sel=S.steps.length-1}
+    render();return;
+  }
+  if(a=e.target.closest('[data-drag="action"]')){S.steps.push(newStep(a.dataset.type,[],a.dataset.preset));sel=S.steps.length-1;render()}
+});
+
+/* ---------- drag and drop ---------- */
+const main=$('#se-main');
+const clr=()=>document.querySelectorAll('#se .over,#se .mb,#se .ma,#se-end.over').forEach(x=>x.classList.remove('over','mb','ma'));
+document.addEventListener('dragstart',e=>{
+  const el=e.target.closest&&e.target.closest('#se [data-drag]');if(!el)return;
+  drag={kind:el.dataset.drag,key:el.dataset.key,type:el.dataset.type,preset:el.dataset.preset,i:+el.dataset.i};
+  e.dataTransfer.effectAllowed='copyMove';
+  try{e.dataTransfer.setData('text/plain',el.dataset.drag)}catch(_){}
+  if(drag.kind==='step'){try{e.dataTransfer.setDragImage(el.closest('.step'),12,12)}catch(_){}}
+});
+document.addEventListener('dragend',()=>{drag=null;clr()});
+main.addEventListener('dragover',e=>{
+  if(!drag)return;e.preventDefault();clr();
+  const tz=e.target.closest('.tz'),st=e.target.closest('.step');
+  if(tz&&drag.kind==='target'){tz.classList.add('over');return}
+  if(st&&drag.kind!=='target'){const r=st.getBoundingClientRect();st.classList.add(e.clientY<r.top+r.height/2?'mb':'ma')}
+  else if(!st)$('#se-end').classList.add('over');
+});
+main.addEventListener('dragleave',e=>{if(!main.contains(e.relatedTarget))clr()});
+main.addEventListener('drop',e=>{
+  if(!drag)return;e.preventDefault();const d=drag;drag=null;clr();
+  const st=e.target.closest('.step');let at=S.steps.length,idx=-1;
+  if(st){idx=+st.dataset.i;const r=st.getBoundingClientRect();at=e.clientY<r.top+r.height/2?idx:idx+1}
+  if(d.kind==='target'){
+    if(idx>=0){const s=S.steps[idx];if(s.t&&!s.t.includes(d.key))s.t.push(d.key);sel=idx}
+    else{S.steps.splice(at,0,newStep('set',[d.key]));sel=at}
+  }else if(d.kind==='action'){S.steps.splice(at,0,newStep(d.type,[],d.preset));sel=at}
+  else if(d.kind==='step'){const[m]=S.steps.splice(d.i,1);if(at>d.i)at--;S.steps.splice(at,0,m);sel=at}
+  render();
+});
+
+/* ---------- preview with the runner ---------- */
+let pj=null,pn=0,pt=null,prun=false;
+const plog=$('#se-log');
+const pset=run=>{prun=run;$('#se-dry').disabled=$('#se-play').disabled=run;$('#se-stop').disabled=!run};
+async function ppoll(){
+  clearTimeout(pt);
+  try{
+    const d=await getJSON(`/api/scene-preview/status?job=${pj??''}&since=${pn}`);
+    if(pj===null&&!d.running){pj=d.job;pn=d.next;pset(false);return}   // an old finished run: don't bring its log back
+    if(d.job!==pj){pj=d.job;plog.textContent=''}
+    if(d.lines.length){plog.hidden=false;const near=plog.scrollTop+plog.clientHeight>=plog.scrollHeight-24;plog.textContent+=(plog.textContent?'\\n':'')+d.lines.join('\\n');if(near)plog.scrollTop=plog.scrollHeight}
+    pn=d.next;pset(d.running);
+    if(d.running)pt=setTimeout(ppoll,700);
+  }catch(e){if(prun)pt=setTimeout(ppoll,2000)}
+}
+async function pstart(mode){
+  const m=check();if(m){toast(m,true);return}
+  const sc=build();if($('#se-once').checked)sc.repeat={mode:'once'};
+  const d=await post('/api/scene-preview/start',{scene:sc,mode,speed:+$('#se-spd').value});
+  if(!d)return;
+  pj=d.job;pn=0;plog.textContent='';plog.hidden=false;pset(true);ppoll();
+}
+$('#se-dry').onclick=()=>pstart('dry');
+$('#se-play').onclick=()=>{if(confirm('Play this scene on your real lights? They stay as the scene leaves them.'))pstart('play')};
+$('#se-stop').onclick=async()=>{if(await post('/api/scene-preview/stop',{}))toast('Stopping…')};
+
+sync();pal();render();ppoll();
+})();
+{% endraw %}
+</script>
+{% endif %}
 </body>
 </html>
 """
@@ -935,6 +1524,14 @@ SCENES_TEMPLATE = """
 # ==========================================
 # 5. View Routes
 # ==========================================
+def scene_inventory(data):
+    """Rooms/zones and lights for the scene editor: v1 ids and names, from the data already fetched.
+    Only rooms and zones are offered because those are the groups the v2 API (and so the runner) can drive."""
+    return {'lights': {i: {'name': l.get('name', '')} for i, l in data['lights'].items()},
+            'groups': {i: {'name': g.get('name', ''), 'type': g.get('type', ''), 'lights': g.get('lights', [])}
+                       for i, g in data['groups'].items() if g.get('type') in ('Room', 'Zone')}}
+
+
 def build_light_groups(groups):
     """{light_id: [(group_id, group_name, group_type), ...]} - rooms first, then by name."""
     m = {}
@@ -945,9 +1542,9 @@ def build_light_groups(groups):
     return m
 
 
-def render(tab, error=None, data=None, user=None, light_groups=None):
+def render(tab, error=None, data=None, user=None, light_groups=None, inventory=None):
     return render_template_string(
-        HTML_TEMPLATE, tab=tab, config=config, user=user, light_groups=light_groups or {},
+        HTML_TEMPLATE, tab=tab, config=config, user=user, light_groups=light_groups or {}, inventory=inventory,
         data=data or {'lights': {}, 'groups': {}, 'sensors': {}, 'schedules': {}},
         error=error, notice=request.args.get('notice'), xy_to_hex=xy_to_hex)
 
@@ -975,13 +1572,18 @@ def logout():
     return redirect('/login')
 
 
+@app.route('/scene-editor')
+def scene_editor_redirect():
+    return redirect('/?tab=scenes')  # the editor is now a tab
+
+
 @app.route('/', methods=['GET'])
 def index():
     user = current_user()
     tab = request.args.get('tab') or ('bridges' if user['role'] == 'admin' else 'lights')
     error = request.args.get('error')
-    admin_tabs = {'bridges', 'sensors', 'settings', 'users'}
-    valid_tabs = {'bridges', 'lights', 'groups', 'sensors', 'settings', 'users', 'account'}
+    admin_tabs = {'bridges', 'sensors', 'settings', 'users', 'scenes'}
+    valid_tabs = {'bridges', 'lights', 'groups', 'sensors', 'settings', 'users', 'scenes', 'account'}
 
     if tab not in valid_tabs:
         return redirect('/?tab=lights')
@@ -997,9 +1599,9 @@ def index():
                 else "No bridge connected yet. Ask your admin to connect one."
             return render(fallback, msg, user=user)
         try:
-            if b and tab in ('lights', 'groups', 'settings'):
+            if b and tab in ('lights', 'groups', 'settings', 'scenes'):
                 data['lights'] = b.get_light()
-            if b and tab in ('lights', 'groups', 'settings', 'users'):
+            if b and tab in ('lights', 'groups', 'settings', 'users', 'scenes'):
                 # 'lights' needs groups too: scope_data uses room membership to
                 # filter which lights a non-admin user is allowed to see.
                 data['groups'] = b.get_group()
@@ -1011,7 +1613,8 @@ def index():
             data = scope_data(user, data)
 
     light_groups = build_light_groups(data['groups']) if tab in ('lights', 'groups') else {}
-    return render(tab, error, data, user=user, light_groups=light_groups)
+    inventory = scene_inventory(data) if tab == 'scenes' else None
+    return render(tab, error, data, user=user, light_groups=light_groups, inventory=inventory)
 
 
 # ==========================================
@@ -1195,12 +1798,208 @@ def delete_group(user, b, id):
     hue_ok(b.delete_group(int(id)))
 
 
+# ---- Device discovery (admin only) ---------------------------------------
+SCAN_KINDS = ('lights', 'sensors')
+
+
+def scan_kind(kind):
+    if kind not in SCAN_KINDS:
+        raise ValueError('Unknown device type')
+    return kind
+
+
+@app.route('/api/bridge/scan', methods=['POST'])
+@api_endpoint
+def start_scan(user, b):
+    """Ask the bridge to open the Zigbee network and search (~40-60s)."""
+    require_admin(user)
+    kind = scan_kind(body().get('kind', 'lights'))
+    # The search call takes no parameters; send {} because phue would otherwise send the text "null".
+    hue_ok(b.request('POST', f'/api/{b.username}/{kind}', {}))
+    return {'kind': kind}
+
+
+@app.route('/api/bridge/scan/status', methods=['GET'])
+@api_endpoint
+def scan_status(user, b):
+    require_admin(user)
+    kind = scan_kind(request.args.get('kind', 'lights'))
+    raw = hue_ok(b.request('GET', f'/api/{b.username}/{kind}/new'))
+    raw = raw if isinstance(raw, dict) else {}
+    last = raw.get('lastscan', 'none')  # "active" while searching, else a timestamp or "none"
+    found = [{'id': k, 'name': v.get('name', '')} for k, v in raw.items()
+             if k != 'lastscan' and isinstance(v, dict)]
+    found.sort(key=lambda f: int(f['id']) if f['id'].isdigit() else 0)
+    return {'scanning': last == 'active', 'lastscan': last, 'found': found}
+
+
+@app.route('/api/device/<kind>/<id>/rename', methods=['POST'])
+@api_endpoint
+def rename_device(user, b, kind, id):
+    require_admin(user)
+    kind = scan_kind(kind)
+    name = (body().get('name') or '').strip()
+    if not id.isdigit():
+        raise ValueError('Invalid device id')
+    if not name:
+        raise ValueError('Name is required')
+    if len(name) > 32:
+        raise ValueError('Names can be at most 32 characters')
+    hue_ok(b.request('PUT', f'/api/{b.username}/{kind}/{id}', {'name': name}))
+
+
+# ---- Scene preview: play the editor's scene with hue_scene_runner.py (admin only) ----
+RUNNER_FILE = 'hue_scene_runner.py'
+PREVIEW_MAX_LINES = 5000
+_pv = {'id': 0, 'running': False, 'lines': [], 'code': None, 'mode': None, 'proc': None}
+_pv_lock = threading.Lock()
+
+
+def _pv_pump(proc, job_id, tmp_path):
+    """Collect the runner's output line by line and note how it ended."""
+    try:
+        for line in proc.stdout:
+            with _pv_lock:
+                if _pv['id'] == job_id:
+                    if len(_pv['lines']) < PREVIEW_MAX_LINES:
+                        _pv['lines'].append(line.rstrip('\n'))
+                    elif len(_pv['lines']) == PREVIEW_MAX_LINES:
+                        _pv['lines'].append('... output truncated ...')
+        code = proc.wait()
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    with _pv_lock:
+        if _pv['id'] == job_id:
+            _pv['lines'].append(f'-- preview finished (exit code {code}) --')
+            _pv['code'], _pv['running'] = code, False
+
+
+def _pv_terminate(proc):
+    """Ask the runner to stop (Ctrl-C, so it can say so); kill it if it takes no notice."""
+    try:
+        if os.name == 'nt':
+            proc.terminate()
+        else:
+            proc.send_signal(signal.SIGINT)
+    except OSError:
+        return
+
+    def reaper():
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    threading.Thread(target=reaper, daemon=True).start()
+
+
+def _pv_cleanup():
+    proc = _pv['proc']
+    if proc and proc.poll() is None:
+        proc.kill()
+
+
+atexit.register(_pv_cleanup)
+
+
+@app.route('/api/scene-preview/start', methods=['POST'])
+@admin_api
+def preview_start(user):
+    d = body()
+    scene, mode = d.get('scene'), d.get('mode')
+    if mode not in ('dry', 'play'):
+        raise ValueError('mode must be "dry" or "play"')
+    if not isinstance(scene, dict) or scene.get('format') != 'hue-scene-sequence' or not scene.get('steps'):
+        raise ValueError('That is not a Hue scene export.')
+    text = json.dumps(scene)
+    if len(text) > 1_000_000:
+        raise ValueError('That scene is too large.')
+    try:
+        speed = float(d.get('speed', 1))
+    except (TypeError, ValueError):
+        raise ValueError('speed must be a number')
+    if not 0.1 <= speed <= 1000:
+        raise ValueError('speed must be between 0.1 and 1000')
+    here = os.path.dirname(os.path.abspath(__file__))
+    runner = os.path.join(here, RUNNER_FILE)
+    if not os.path.exists(runner):
+        raise ValueError(f'{RUNNER_FILE} was not found next to phadmin.py.')
+    with _pv_lock:
+        if _pv['running']:
+            raise ValueError('A preview is already running. Stop it first.')
+        fd, tmp = tempfile.mkstemp(suffix='.hue-scene.json')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+        # The runner reads this same config.json (bridge, key, pinned certificate).
+        cmd = [sys.executable, '-u', runner, tmp, '--config', os.path.abspath(CONFIG_FILE)]
+        cmd += ['--dry-run'] if mode == 'dry' else ['--speed', str(speed)]
+        try:
+            proc = subprocess.Popen(cmd, cwd=here, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, encoding='utf-8', errors='replace', bufsize=1,
+                                    env=dict(os.environ, PYTHONIOENCODING='utf-8'))
+        except OSError as e:
+            os.remove(tmp)
+            raise ValueError(f'Could not start the runner: {e}')
+        _pv.update(id=_pv['id'] + 1, running=True, lines=[], code=None, mode=mode, proc=proc)
+        job = _pv['id']
+    threading.Thread(target=_pv_pump, args=(proc, job, tmp), daemon=True).start()
+    return {'job': job}
+
+
+@app.route('/api/scene-preview/status', methods=['GET'])
+@admin_api
+def preview_status(user):
+    with _pv_lock:
+        try:
+            since = int(request.args.get('since', 0))
+        except ValueError:
+            since = 0
+        if request.args.get('job') != str(_pv['id']):
+            since = 0  # a different job than the caller knows: send it from the start
+        return {'job': _pv['id'], 'running': _pv['running'], 'code': _pv['code'], 'mode': _pv['mode'],
+                'lines': _pv['lines'][max(since, 0):], 'next': len(_pv['lines'])}
+
+
+@app.route('/api/scene-preview/stop', methods=['POST'])
+@admin_api
+def preview_stop(user):
+    with _pv_lock:
+        proc = _pv['proc'] if _pv['running'] else None
+    if proc:
+        _pv_terminate(proc)
+    return {'stopping': bool(proc)}
+
+
 # ---- Sensors (admin only) -------------------------------------------------
 @app.route('/api/sensors', methods=['GET'])
 @api_endpoint
 def list_sensors(user, b):
     require_admin(user)
-    return {'devices': summarize_sensors(b.get_sensor())}
+    contacts, notice = contact_devices(b)
+    return {'devices': sort_devices(summarize_sensors(b.get_sensor()) + contacts), 'notice': notice}
+
+
+UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+
+@app.route('/api/v2/contact/<rid>', methods=['POST'])
+@api_endpoint
+def set_contact_enabled(user, b, rid):
+    """Enable/disable a contact sensor (whether the bridge uses it in automations)."""
+    require_admin(user)
+    if not UUID_RE.match(rid):
+        raise ValueError('Invalid sensor id')
+    enabled = body().get('enabled')
+    if not isinstance(enabled, bool):
+        raise ValueError('"enabled" must be true or false')
+    try:
+        v2_request(b.ip, b.username, 'PUT', f'contact/{rid}', {'enabled': enabled})
+    except V2Unsupported:
+        raise V2Error('That sensor was not found on the bridge')
+    with _v2_lock:
+        _v2_state.get(b.ip, {}).pop('contacts', None)  # show the change on the next refresh
 
 
 SENSOR_CONFIG_KEYS = {'on': bool, 'ledindication': bool, 'sensitivity': int, 'tholddark': int, 'tholdoffset': int}
